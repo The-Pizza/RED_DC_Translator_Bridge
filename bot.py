@@ -140,6 +140,16 @@ def message_to_dict(msg: discord.Message) -> dict:
         "is_thread": isinstance(msg.channel, discord.Thread)
     }
 
+def should_forward_embeds(message: discord.Message) -> bool:
+    """
+    Forward original embeds only when there is no URL in content.
+    If content has a URL, Discord will auto-unfurl it in destination channels,
+    and forwarding embeds as well causes duplicate previews.
+    """
+    content = (message.content or "").lower()
+    has_url = "http://" in content or "https://" in content
+    return bool(message.embeds) and not has_url
+
 async def translate_text(content: str, target_language: str) -> str:
     """
     Translate text to target language using LLM API.
@@ -224,7 +234,7 @@ async def post_translation_to_discord(guild: discord.Guild, channel_id: str, aut
         else:
             await channel.send(f"{header}\n{translated_text}", files=files)
         
-        # Send any embeds from original message (like GIF picker embeds)
+        # Send original embeds only when URL auto-unfurl is not available.
         if embeds:
             for embed in embeds:
                 try:
@@ -351,8 +361,8 @@ async def on_message(message: discord.Message):
                     if message.content or files:
                         await channel.send(f"<@{message.author.id}>\n{message.content}" if message.content else f"<@{message.author.id}>", files=files)
                     
-                    # Send embeds separately
-                    if message.embeds:
+                    # Send embeds separately only when URL auto-unfurl is not available
+                    if should_forward_embeds(message):
                         for embed in message.embeds:
                             try:
                                 await channel.send(embed=embed)
@@ -386,8 +396,8 @@ async def on_message(message: discord.Message):
                             if message.content or files:
                                 await channel.send(f"<@{message.author.id}>\n{message.content}" if message.content else f"<@{message.author.id}>", files=files)
                             
-                            # Send embeds separately
-                            if message.embeds:
+                            # Send embeds separately only when URL auto-unfurl is not available
+                            if should_forward_embeds(message):
                                 for embed in message.embeds:
                                     try:
                                         await channel.send(embed=embed)
@@ -409,9 +419,10 @@ async def on_message(message: discord.Message):
             async def translate_to_main():
                 translated = await translate_text(message.content, main_default)
                 if translated:
+                    forward_embeds = message.embeds if should_forward_embeds(message) else None
                     await post_translation_to_discord(message.guild, str(main_id), str(message.author.id),
                                                     detected_language or "Unknown", main_default, translated,
-                                                    attachments=message.attachments, embeds=message.embeds)
+                                                    attachments=message.attachments, embeds=forward_embeds)
             
             tasks.append(translate_to_main())
             
@@ -423,9 +434,10 @@ async def on_message(message: discord.Message):
                         logger.info(f"Message to alt channel {alt_data['id']}: {detected_language} → {alt_data['lang']}")
                         translated = await translate_text(message.content, alt_data["lang"])
                         if translated:
+                            forward_embeds = message.embeds if should_forward_embeds(message) else None
                             await post_translation_to_discord(message.guild, str(alt_data["id"]), str(message.author.id),
                                                             detected_language or "Unknown", alt_data["lang"], translated,
-                                                            attachments=message.attachments, embeds=message.embeds)
+                                                            attachments=message.attachments, embeds=forward_embeds)
                     
                     tasks.append(translate_to_alt())
             
@@ -452,9 +464,10 @@ async def on_message(message: discord.Message):
                     translated = await translate_text(message.content, default_lang)
                     # Only post if translation is different from original (avoid false positives)
                     if translated and translated != message.content:
+                        forward_embeds = message.embeds if should_forward_embeds(message) else None
                         await post_translation_to_discord(message.guild, str(base_id), str(message.author.id),
                                                         context_detected_lang, default_lang, translated,
-                                                        attachments=message.attachments, embeds=message.embeds)
+                                                        attachments=message.attachments, embeds=forward_embeds)
                 elif expected_code and not context_detected_code:
                     logger.debug("Language detection unavailable/unknown; skipping default-language mismatch translation")
             except Exception as e:
@@ -488,8 +501,8 @@ async def on_message(message: discord.Message):
                         if message.content or files:
                             await channel.send(f"<@{message.author.id}>\n{message.content}" if message.content else f"<@{message.author.id}>", files=files)
                         
-                        # Send embeds separately
-                        if message.embeds:
+                        # Send embeds separately only when URL auto-unfurl is not available
+                        if should_forward_embeds(message):
                             for embed in message.embeds:
                                 try:
                                     await channel.send(embed=embed)
@@ -509,9 +522,10 @@ async def on_message(message: discord.Message):
                     logger.info(f"Message from main channel: {detected_language} → {alt_data['lang']}")
                     translated = await translate_text(message.content, alt_data["lang"])
                     if translated:
+                        forward_embeds = message.embeds if should_forward_embeds(message) else None
                         await post_translation_to_discord(message.guild, str(alt_data["id"]), str(message.author.id),
                                                         detected_language or "Unknown", alt_data["lang"], translated,
-                                                        attachments=message.attachments, embeds=message.embeds)
+                                                        attachments=message.attachments, embeds=forward_embeds)
                 
                 tasks.append(translate_to_alt())
             
