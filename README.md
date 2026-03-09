@@ -6,10 +6,11 @@ A Discord bot that automatically detects and bridges messages across multiple la
 
 RED DC Translator Bridge is a sophisticated Discord bot that:
 
-- **Detects message languages** using linguistic analysis
+- **Detects message languages** using Meta's fastText model with context-aware confidence thresholds
 - **Bridges alternate language channels** (e.g., "general-but-in-spanish")
+- **Translates messages directly using LLM APIs** with parallel execution for speed (Grok, OpenAI-compatible, etc.)
 - **Monitors channel language mismatches** against expected defaults
-- **Forwards messages with translation metadata** to configured webhook endpoints
+- **Handles media-only messages** (Tenor, Giphy, Imgur) intelligently to preserve auto-embeds
 - **Creates language-specific channels** on demand through slash commands
 
 The bot is designed for environments where teams communicate in multiple languages and need intelligent message routing and translation coordination.
@@ -31,90 +32,147 @@ Pull and run the Docker image:
 ```bash
 docker run -d \
   -e DISCORD_TOKEN=your_bot_token \
-  -e WEBHOOK_URL=https://your-webhook-endpoint.com \
+  -e LLM_API_KEY=your_api_key \
+  -e LLM_API_URL=https://api.x.ai/v1/chat/completions \
+  -e LLM_MODEL=grok-4-1-fast-non-reasoning \
   -e LOG_LEVEL=INFO \
   -e GUILD_ID=optional_server_id \
   -v translator-data:/data \
   ghcr.io/the-pizza/red-dc-translator-bridge:latest
 ```
 
+**Important**: The container automatically downloads the 131MB fastText language model (`lid.176.bin`) on first startup. This is stored in the `/data` volume for persistence.
+
 ### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Discord bot token |
-| `WEBHOOK_URL` | No | Webhook endpoint for message forwarding |
+| `LLM_API_KEY` | Yes | API key for your LLM provider (Grok, OpenAI, etc.) |
+| `LLM_API_URL` | No | LLM API endpoint (default: `https://api.x.ai/v1/chat/completions` for Grok) |
+| `LLM_MODEL` | No | Model identifier (default: `grok-4-1-fast-non-reasoning`) |
+| `LLM_SYSTEM_PROMPT` | No | Custom system prompt for the translator (default: professional translator prompt) |
 | `GUILD_ID` | No | Specific server ID for faster slash command sync (global sync if omitted) |
 | `LOG_LEVEL` | No | Logging level (default: `INFO`) - options: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `DATA_DIR` | No | Directory for storing configuration (default: `/data`) |
 
+### LLM Provider Configuration
+
+#### Grok (Default)
+```bash
+docker run -d \
+  -e DISCORD_TOKEN=your_discord_token \
+  -e LLM_API_KEY=your_grok_api_key \
+  -e LLM_API_URL=https://api.x.ai/v1/chat/completions \
+  -e LLM_MODEL=grok-4-1-fast-non-reasoning \
+  -v translator-data:/data \
+  ghcr.io/the-pizza/red-dc-translator-bridge:latest
+```
+
+#### OpenAI
+```bash
+docker run -d \
+  -e DISCORD_TOKEN=your_discord_token \
+  -e LLM_API_KEY=your_openai_api_key \
+  -e LLM_API_URL=https://api.openai.com/v1/chat/completions \
+  -e LLM_MODEL=gpt-4-turbo \
+  -v translator-data:/data \
+  ghcr.io/the-pizza/red-dc-translator-bridge:latest
+```
+
+#### Compatible Alternatives
+Any OpenAI-compatible API endpoint works (Azure OpenAI, local LM Studio, Ollama, etc.). Just set:
+- `LLM_API_URL` to your endpoint
+- `LLM_API_KEY` to your authentication key
+- `LLM_MODEL` to the appropriate model name
+
 ## Local Development
 
 ### Prerequisites
+- Python 3.10+
+- Build tools (`build-essential`, `g++` for fastText compilation)
+- Discord bot token
+- LLM API credentials (Grok, OpenAI, etc.)
 
-- Python 3.12+
-- pip
-
-### Installation
+### Setup
 
 ```bash
+# Clone repository
+git clone https://github.com/The-Pizza/RED_DC_Translator_Bridge.git
+cd RED_DC_Translator_Bridge
+
+# Install build dependencies (Debian/Ubuntu)
+sudo apt-get update && sudo apt-get install -y build-essential g++
+
+# Install dependencies
 pip install -r requirements.txt
-```
 
-### Running Locally
+# Download fastText language model (131MB)
+mkdir -p data
+wget -O data/lid.176.bin https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
 
-```bash
-export DISCORD_TOKEN=your_bot_token
-export WEBHOOK_URL=https://your-webhook-endpoint.com
+# Set environment variables
+export DISCORD_TOKEN=your_discord_token
+export LLM_API_KEY=your_api_key
+export LLM_API_URL=https://api.x.ai/v1/chat/completions
+export LLM_MODEL=grok-4-1-fast-non-reasoning
+export LOG_LEVEL=INFO
+
+# Run bot
 python bot.py
 ```
 
-## How It Works
+## Commands
 
-### Channel Bridging
+### `/channeldefaultlanguage`
+Set the default language for a channel. When messages in a different language are posted, they'll be automatically translated to the channel's default language.
 
-The bot recognizes channels with the naming pattern `name-but-in-language`:
+**Usage:** `/channeldefaultlanguage language:English`
 
-- **Main Channel**: `general`
-- **Alternate Channel**: `general-but-in-spanish`
-
-Messages are automatically routed between these channels with language metadata attached.
-
-### Commands
-
-#### `/channeldefaultlanguage <language>`
-Set the expected default language for a channel. The bot will forward any messages in other languages to the configured webhook.
-
-**Example:**
-```
-/channeldefaultlanguage English
-```
-
-#### `/removedefaultlanguage`
+### `/removedefaultlanguage`
 Stop monitoring a channel for language mismatches.
 
-#### `/createalternatelanguagechannel <language>`
-Create a new alternate language channel (automatically named `current-channel-name but in <language>`).
+**Usage:** `/removedefaultlanguage`
 
-**Example:**
-```
-/createalternatelanguagechannel Spanish
-```
+### `/createalternatelanguagechannel`
+Create a new alternate language channel in the format `channel-name-but-in-{language}`. Messages in the main channel will automatically be translated to this alternate channel, and vice versa.
 
-### Message Flow
+**Usage:** `/createalternatelanguagechannel language:Spanish`
 
-1. **Detection**: Message language is automatically detected
-2. **Routing**:
-   - If in an alternate channel → forward to main channel + other alternates
-   - If in main channel → forward to all alternate channels
-   - If language mismatches channel default → forward to webhook
-3. **Webhook Payload**: Message with language metadata is sent to configured endpoint
+## How It Works
+
+### Language Detection
+
+The bot uses Meta's **fastText** pre-trained model (`lid.176.bin`) to detect language with context-aware confidence thresholds:
+- When a channel has an expected default language, the bot requires **50% confidence** for a different language detection
+- Supports 176 languages with high accuracy even on short text fragments
+- Model is lightweight (131MB) and extremely fast
+
+### Message Routing & Translation
+
+1. **Message Detection**: When a message is posted, the bot detects its language using fastText
+2. **Media Handling**: Messages containing only media URLs (Tenor, Giphy, Imgur, etc.) are cross-posted without translation to preserve auto-embeds
+3. **Routing Logic**:
+   - **Alternate channels**: Messages from "channel-but-in-spanish" are translated to the main channel and all other alternate language channels
+   - **Default language monitoring**: If a channel has a default language set and a message in a different language is posted, it gets translated to the channel's default language
+   - **Main channels**: Messages are translated and forwarded to all alternate language channels
+4. **Parallel Translation**: When translating to multiple channels, all LLM API calls execute concurrently using `asyncio.gather()` for optimal performance
+5. **LLM Translation**: The detected text is sent to your configured LLM (Grok, OpenAI, etc.) for high-quality translation
+6. **Posting**: The translated message is posted with a header showing the original author and language pair
 
 ### Supported Languages
 
 English, Arabic, Spanish, French, German, Italian, Portuguese, Russian, Chinese, Japanese, Korean, Hindi
 
 (Can be extended by modifying the `LANGUAGE_CODES` dictionary in `bot.py`)
+
+## System Requirements
+
+- 256MB+ RAM (plus 131MB for fastText model)
+- Stable internet connection
+- Discord server with "Manage Channels" and "Manage Webhooks" permissions for bot
+- LLM API access (free tiers available for many providers)
+- Build tools for compiling fastText (if installing from source)
 
 ## Configuration Storage
 
@@ -125,8 +183,15 @@ Default language settings are persisted to `/data/default_languages.json` (or `D
 See [requirements.txt](requirements.txt):
 
 - `discord.py>=2.3.0` - Discord bot library
-- `requests` - HTTP client for webhooks
-- `lingua-language-detector` - Language detection engine
+- `requests` - HTTP client for LLM API calls
+- `fasttext` - Meta's language detection engine (requires numpy<2 for compatibility)
+- `numpy<2` - Numerical computing library (pinned for fastText runtime compatibility)
+
+## Performance
+
+- **Parallel Translation**: When routing messages to multiple channels, all translations execute concurrently for minimal latency
+- **Language Detection**: fastText inference is extremely fast (<1ms per message)
+- **Media Handling**: Media-only URLs bypass translation entirely to preserve Discord auto-embeds
 
 ## License
 

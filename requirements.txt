@@ -1,3 +1,5 @@
 discord.py>=2.3.0
 requests
-lingua-language-detector
+aiohttp
+numpy<2
+fasttext

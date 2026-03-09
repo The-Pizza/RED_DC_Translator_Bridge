@@ -1,0 +1,37 @@
+{
+	"name": "RED_DC_Translator_Bridge",
+	"image": "python:3.11-slim",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-python.debugpy",
+				"ms-python.vscode-pylance"
+			],
+			"settings": {
+				"python.linting.enabled": true,
+				"python.linting.pylintEnabled": true,
+				"python.formatting.provider": "black",
+				"[python]": {
+					"editor.defaultFormatter": "ms-python.python",
+					"editor.formatOnSave": true
+				}
+			}
+		}
+	},
+	"remoteEnv": {
+		"DISCORD_TOKEN": "MTQ4MDQxMzg3MzQwMzA3MjU0Mw.GfkVJI.ks2Pcy6HAeWkrUUGNjWKILwxY5ffMy_UJU8goI",
+		"LLM_API_KEY": "xai-ly17sQ4dna113PslgspQFsk7e2zu2mqB68OHwJocGAs8SFvOWluVDupjeLl0rPDLUbMBrA1JA2BSnusu",
+		"LLM_API_URL": "https://api.x.ai/v1/chat/completions",
+		"LLM_MODEL": "grok-4-1-fast-non-reasoning",
+		"GUILD_ID": "",
+		"LOG_LEVEL": "DEBUG",
+		"DATA_DIR": "/data"
+	},
+	"containerEnv": {
+		"PYTHONUNBUFFERED": "1"
+	},
+	"postCreateCommand": "apt-get update && apt-get install -y build-essential g++ && pip install --no-cache-dir -r requirements.txt && mkdir -p /data && python -c \"import requests; r = requests.get('https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin'); open('/data/lid.176.bin', 'wb').write(r.content)\"",
+	"remoteUser": "root",
+	"forwardPorts": []
+}
