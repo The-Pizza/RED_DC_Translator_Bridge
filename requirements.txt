@@ -3,3 +3,7 @@ requests
 aiohttp
 numpy<2
 fasttext
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+asyncpg>=0.29.0
+alembic>=1.13.0

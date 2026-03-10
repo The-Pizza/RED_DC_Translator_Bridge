@@ -54,7 +54,8 @@ docker run -d \
 | `LLM_SYSTEM_PROMPT` | No | Custom system prompt for the translator (default: professional translator prompt) |
 | `GUILD_ID` | No | Specific server ID for faster slash command sync (global sync if omitted) |
 | `LOG_LEVEL` | No | Logging level (default: `INFO`) - options: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `DATA_DIR` | No | Directory for storing configuration (default: `/data`) |
+| `DATA_DIR` | No | Directory for storing data (default: `/data`) |
+| `DATABASE_URL` | No | Database connection string (default: `sqlite+aiosqlite:///data/bot.db` for SQLite) |
 
 ### LLM Provider Configuration
 
@@ -139,6 +140,11 @@ Create a new alternate language channel in the format `channel-name-but-in-{lang
 
 **Usage:** `/createalternatelanguagechannel language:Spanish`
 
+### `/stats`
+Display bot usage statistics including message counts, translations, configured channels, and most popular languages. Results are shown only to you (ephemeral message).
+
+**Usage:** `/stats`
+
 ## How It Works
 
 ### Language Detection
@@ -159,6 +165,17 @@ The bot uses Meta's **fastText** pre-trained model (`lid.176.bin`) to detect lan
 4. **Parallel Translation**: When translating to multiple channels, all LLM API calls execute concurrently using `asyncio.gather()` for optimal performance
 5. **LLM Translation**: The detected text is sent to your configured LLM (Grok, OpenAI, etc.) for high-quality translation
 6. **Posting**: The translated message is posted with a header showing the original author and language pair
+7. **Message Tracking**: All messages are tracked in the database with unique IDs for reply routing and reaction syncing
+
+### Reaction Syncing
+
+When a user adds a reaction to a message in any bridged channel, the bot automatically:
+- Detects the reaction on the tracked message
+- Looks up all related messages (translations in other channels)
+- Adds the same reaction to all linked messages asynchronously
+- Tracks the reaction sync in the database for statistics
+
+This keeps reactions synchronized across all language channels, maintaining engagement context regardless of which language channel users are viewing.
 
 ### Supported Languages
 
@@ -170,13 +187,57 @@ English, Arabic, Spanish, French, German, Italian, Portuguese, Russian, Chinese,
 
 - 256MB+ RAM (plus 131MB for fastText model)
 - Stable internet connection
-- Discord server with "Manage Channels" and "Manage Webhooks" permissions for bot
+- Discord server with required bot permissions:
+  - **Manage Channels** - for creating alternate language channels
+  - **Read Messages/View Channels** - for monitoring messages
+  - **Send Messages** - for posting translations
+  - **Add Reactions** - for syncing reactions across bridged messages
+  - **Read Message History** - for fetching messages when syncing reactions
+  - **Embed Links** - for sending rich embeds
 - LLM API access (free tiers available for many providers)
 - Build tools for compiling fastText (if installing from source)
 
+## Discord Bot Setup
+
+When creating your Discord bot in the [Discord Developer Portal](https://discord.com/developers/applications):
+
+1. Enable the following **Privileged Gateway Intents**:
+   - **Message Content Intent** - required to read message text
+   - *(Reactions Intent is not privileged, enabled by default)*
+
+2. Bot permissions (for invite link):
+   - Manage Channels
+   - Read Messages/View Channels  
+   - Send Messages
+   - Add Reactions
+   - Read Message History
+   - Embed Links
+   - Use Slash Commands
+
 ## Configuration Storage
 
-Default language settings are persisted to `/data/default_languages.json` (or `DATA_DIR` if configured).
+The bot uses **SQLAlchemy** with database persistence for storing:
+- Channel default language settings
+- Message tracking for reply routing and reaction syncing
+- Usage statistics
+
+### Database Backends
+
+**SQLite (Default)**:
+- Stores data in `/data/bot.db`
+- Zero configuration required
+- Perfect for single-instance deployments
+- Database file persists in the `/data` volume
+
+**PostgreSQL (Optional)**:
+- For larger deployments or multi-shard setups
+- Set `DATABASE_URL` environment variable:
+  ```bash
+  DATABASE_URL=postgresql+asyncpg://user:password@postgres-host:5432/botdb
+  ```
+- Requires PostgreSQL server (not included in container)
+
+The bot automatically creates all required tables on first startup. No manual database setup needed.
 
 ## Requirements
 
@@ -184,8 +245,13 @@ See [requirements.txt](requirements.txt):
 
 - `discord.py>=2.3.0` - Discord bot library
 - `requests` - HTTP client for LLM API calls
+- `aiohttp` - Async HTTP client
 - `fasttext` - Meta's language detection engine (requires numpy<2 for compatibility)
 - `numpy<2` - Numerical computing library (pinned for fastText runtime compatibility)
+- `sqlalchemy>=2.0.0` - Database ORM with async support
+- `aiosqlite>=0.19.0` - Async SQLite driver
+- `asyncpg>=0.29.0` - Async PostgreSQL driver
+- `alembic>=1.13.0` - Database migrations (future use)
 
 ## Performance
 

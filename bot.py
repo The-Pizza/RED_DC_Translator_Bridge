@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import asyncio
 import io
@@ -10,6 +9,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import fasttext
+
+# Database layer
+import database as db
 
 # ========================== CONFIG ==========================
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -26,7 +28,6 @@ LLM_SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT",
     "translate it accurately. Do not translate URLs, links, or emojis - pass them through unchanged. "
     "Respond with ONLY the translated text, nothing else."
 )
-DEFAULT_FILE = os.path.join(DATA_DIR, "default_languages.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -63,10 +64,9 @@ else:
         logger.error(f"Failed to load fastText model: {e}")
         model = None
 
-# In-memory storage
-default_languages = {}      # guild_id_str -> {channel_id_str: lang_name}
-main_to_alts = {}           # guild_id -> {main_id: [{{"id": alt_id, "lang": lang_name}}, ...]}
-alt_to_main = {}            # alt_id -> {{"main_id": , "lang": }}
+# In-memory storage for channel mappings (populated from channel names at startup)
+main_to_alts = {}           # guild_id -> {main_id: [{"id": alt_id, "lang": lang_name}, ...]}
+alt_to_main = {}            # alt_id -> {"main_id": , "lang": }
 
 
 @dataclass
@@ -86,6 +86,7 @@ class MessageContext:
     source_main_id: Optional[int]
     source_main_default_language: Optional[str]
     source_alts: List[dict]
+    reply_to_message_id: Optional[int]
 
 
 @dataclass
@@ -168,23 +169,13 @@ def detect_language(text: str, expected_language: str = None) -> str:
         logger.error(f"Language detection failed: {e}")
         return None
 
-def load_defaults():
-    global default_languages
-    if os.path.exists(DEFAULT_FILE):
-        try:
-            with open(DEFAULT_FILE, encoding="utf-8") as f:
-                default_languages = json.load(f)
-            logger.info(f"Loaded defaults for {len(default_languages)} guilds")
-        except Exception as e:
-            logger.error(f"Failed to load defaults: {e}")
-
-def save_defaults():
-    os.makedirs(DATA_DIR, exist_ok=True)
+async def get_channel_language(guild_id: int, channel_id: int) -> Optional[str]:
+    """Get the default language for a channel from database"""
     try:
-        with open(DEFAULT_FILE, "w", encoding="utf-8") as f:
-            json.dump(default_languages, f, indent=2, ensure_ascii=False)
+        return await db.get_channel_default(guild_id, channel_id)
     except Exception as e:
-        logger.error(f"Failed to save defaults: {e}")
+        logger.error(f"Failed to get channel default: {e}")
+        return None
 
 def should_forward_embeds(message: discord.Message) -> bool:
     """
@@ -195,7 +186,6 @@ def should_forward_embeds(message: discord.Message) -> bool:
     content = (message.content or "").lower()
     has_url = "http://" in content or "https://" in content
     return bool(message.embeds) and not has_url
-
 
 def is_media_only_message(message: discord.Message, has_content: bool, has_attachments: bool, has_embeds: bool) -> bool:
     """Classify whether a message should skip translation and be forwarded as media-only."""
@@ -213,7 +203,6 @@ def is_media_only_message(message: discord.Message, has_content: bool, has_attac
 
     return is_media_only
 
-
 def analyze_message(message: discord.Message) -> Optional[MessageContext]:
     """Analyze inbound message once and normalize all routing/language state."""
     if message.author.bot:
@@ -229,7 +218,10 @@ def analyze_message(message: discord.Message) -> Optional[MessageContext]:
     is_media_only = is_media_only_message(message, has_content, has_attachments, has_embeds)
     base_id = message.channel.parent_id if isinstance(message.channel, discord.Thread) else message.channel.id
     guild_id = message.guild.id
-    expected_language = default_languages.get(str(guild_id), {}).get(str(base_id))
+    
+    # Note: expected_language will be fetched async in on_message handler for now
+    # We'll refactor this to be fully async later if needed
+    expected_language = None  # Placeholder - will be looked up in handler
 
     detected_code = None if is_media_only else detect_language(message.content, expected_language=expected_language)
     detected_language = CODE_TO_LANGUAGE.get(detected_code) if detected_code else None
@@ -240,7 +232,8 @@ def analyze_message(message: discord.Message) -> Optional[MessageContext]:
     source_alts = []
 
     if is_alt_source and source_main_id is not None:
-        source_main_default_language = default_languages.get(str(guild_id), {}).get(str(source_main_id), "English")
+        # Note: Will need to fetch from DB in main handler
+        source_main_default_language = None  # Placeholder
         source_alts = main_to_alts.get(guild_id, {}).get(source_main_id, [])
     elif not is_alt_source:
         source_alts = main_to_alts.get(guild_id, {}).get(base_id, [])
@@ -267,8 +260,8 @@ def analyze_message(message: discord.Message) -> Optional[MessageContext]:
         source_main_id=source_main_id,
         source_main_default_language=source_main_default_language,
         source_alts=source_alts,
+        reply_to_message_id=message.reference.message_id if message.reference else None,
     )
-
 
 def build_route_plan(context: MessageContext) -> List[RouteAction]:
     """Build delivery plan without performing network/translation work."""
@@ -327,7 +320,6 @@ def build_route_plan(context: MessageContext) -> List[RouteAction]:
 
     return plan
 
-
 async def fetch_attachment_payloads(attachments: List[discord.Attachment]) -> List[tuple]:
     """Download attachments once and keep raw bytes for per-destination file creation."""
     payloads: List[tuple] = []
@@ -348,7 +340,6 @@ async def fetch_attachment_payloads(attachments: List[discord.Attachment]) -> Li
                 logger.warning(f"Failed to download attachment {attachment.filename}: {e}")
     return payloads
 
-
 async def compose_outbound_messages(context: MessageContext, plan: List[RouteAction]) -> List[OutboundMessage]:
     """Compose outbound payloads (copy/translate) that can be sent via one sender function."""
     outbounds: List[OutboundMessage] = []
@@ -359,12 +350,39 @@ async def compose_outbound_messages(context: MessageContext, plan: List[RouteAct
 
     embeds = list(context.message.embeds) if context.should_forward_original_embeds else []
     body_text = context.message.content or ""
+    
+    # For each destination, look up what message to reply to (if this is a reply)
+    # This uses bidirectional linking: works whether replying in main or alt channel
+    reply_targets: dict = {}  # destination_channel_id -> reply_to_message_id
+    if context.reply_to_message_id:
+        try:
+            # Get ALL linked messages for the message being replied to
+            # This works for both source and destination messages
+            linked_messages = await db.get_all_linked_messages(
+                message_id=context.reply_to_message_id,
+                channel_id=context.base_id
+            )
+            
+            # Build a map of channel_id -> message_id for quick lookup
+            for linked_msg in linked_messages:
+                reply_targets[linked_msg['channel_id']] = linked_msg['message_id']
+            
+            if reply_targets:
+                logger.debug(f"Found reply targets in {len(reply_targets)} channels for message {context.reply_to_message_id}")
+        except Exception as e:
+            logger.warning(f"Failed to find reply targets: {e}")
 
     async def compose_translate(action: RouteAction) -> Optional[OutboundMessage]:
         if not action.target_language:
             return None
 
-        translated = await translate_text(body_text, action.target_language)
+        translated = await translate_text(
+            body_text, 
+            action.target_language,
+            guild_id=context.guild_id,
+            source_language=context.detected_language,
+            message_id=context.message.id
+        )
         if not translated:
             return None
 
@@ -381,6 +399,7 @@ async def compose_outbound_messages(context: MessageContext, plan: List[RouteAct
             embeds=embeds,
             detected_language=context.detected_language,
             target_language=action.target_language,
+            reply_to_message_id=reply_targets.get(action.destination_channel_id),
         )
 
     translate_actions: List[RouteAction] = []
@@ -396,6 +415,7 @@ async def compose_outbound_messages(context: MessageContext, plan: List[RouteAct
                     embeds=embeds,
                     detected_language=context.detected_language,
                     target_language=None,
+                    reply_to_message_id=reply_targets.get(action.destination_channel_id),
                 )
             )
         elif action.action_type == "translate":
@@ -407,30 +427,43 @@ async def compose_outbound_messages(context: MessageContext, plan: List[RouteAct
 
     return outbounds
 
-
-async def send_outbound_message(guild: discord.Guild, outbound: OutboundMessage):
-    """Single sender entrypoint for all outbound message variants."""
+async def send_outbound_message(guild: discord.Guild, outbound: OutboundMessage) -> Optional[discord.Message]:
+    """Single sender entrypoint for all outbound message variants. Returns the sent message."""
     try:
         channel = guild.get_channel(int(outbound.destination_channel_id))
         if not channel:
             logger.error(f"Channel {outbound.destination_channel_id} not found")
-            return
+            return None
 
         files = [discord.File(io.BytesIO(data), filename=filename) for filename, data in outbound.attachments_data]
         body = outbound.translated_text if outbound.translated_text is not None else outbound.body_text
+        
+        # Prepare reply reference if this is a reply
+        reply_reference = None
+        if outbound.reply_to_message_id:
+            try:
+                # Fetch the message to reply to
+                reply_msg = await channel.fetch_message(outbound.reply_to_message_id)
+                reply_reference = discord.MessageReference(message_id=reply_msg.id, channel_id=channel.id)
+                logger.debug(f"Replying to message {outbound.reply_to_message_id} in channel {channel.id}")
+            except discord.NotFound:
+                logger.warning(f"Reply target message {outbound.reply_to_message_id} not found in channel {channel.id}")
+            except Exception as e:
+                logger.warning(f"Failed to create reply reference: {e}")
 
+        sent_message = None
         if outbound.translated_text is not None:
             if len(body) > 2000:
                 embed = discord.Embed(description=body)
-                await channel.send(content=outbound.header_text, embed=embed, files=files)
+                sent_message = await channel.send(content=outbound.header_text, embed=embed, files=files, reference=reply_reference)
             else:
-                await channel.send(f"{outbound.header_text}\n{body}", files=files)
+                sent_message = await channel.send(f"{outbound.header_text}\n{body}", files=files, reference=reply_reference)
         else:
             if body or files:
                 if body:
-                    await channel.send(f"{outbound.header_text}\n{body}", files=files)
+                    sent_message = await channel.send(f"{outbound.header_text}\n{body}", files=files, reference=reply_reference)
                 else:
-                    await channel.send(outbound.header_text, files=files)
+                    sent_message = await channel.send(outbound.header_text, files=files, reference=reply_reference)
 
         for embed in outbound.embeds:
             try:
@@ -440,15 +473,33 @@ async def send_outbound_message(guild: discord.Guild, outbound: OutboundMessage)
 
         logger.info(
             f"Sent outbound to channel {outbound.destination_channel_id} "
-            f"(translated={outbound.translated_text is not None}, attachments={len(files)}, embeds={len(outbound.embeds)})"
+            f"(translated={outbound.translated_text is not None}, attachments={len(files)}, embeds={len(outbound.embeds)}, "
+            f"reply={outbound.reply_to_message_id is not None})"
         )
+        return sent_message
     except Exception as e:
         logger.error(f"Failed to send outbound message: {e}")
+        return None
 
-async def translate_text(content: str, target_language: str) -> str:
+async def translate_text(
+    content: str, 
+    target_language: str,
+    guild_id: Optional[int] = None,
+    source_language: Optional[str] = None,
+    message_id: Optional[int] = None
+) -> str:
     """
     Translate text to target language using LLM API.
     Returns translated text or None if translation fails or API is not configured.
+    
+    Also tracks token usage in the database for billing purposes.
+    
+    Args:
+        content: Text to translate
+        target_language: Target language name (e.g., "English", "Arabic")
+        guild_id: Guild ID for token tracking (optional)
+        source_language: Source language name for tracking (optional)
+        message_id: Discord message ID for tracking (optional)
     """
     if not LLM_API_KEY:
         logger.warning("LLM_API_KEY not configured, skipping translation")
@@ -481,6 +532,28 @@ async def translate_text(content: str, target_language: str) -> str:
         if response.status_code == 200:
             result = response.json()
             translated = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            
+            # Track token usage if available in response
+            usage = result.get("usage", {})
+            if usage and guild_id:
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", 0)
+                
+                # Track asynchronously in background (don't await to avoid blocking)
+                asyncio.create_task(
+                    db.track_token_usage(
+                        guild_id=guild_id,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        model=LLM_MODEL,
+                        source_language=source_language,
+                        target_language=target_language,
+                        message_id=message_id
+                    )
+                )
+                logger.debug(f"Token usage: {total_tokens} total (prompt: {prompt_tokens}, completion: {completion_tokens})")
             
             if translated:
                 logger.debug(f"Translation successful: {content[:50]}... → {translated[:50]}...")
@@ -516,11 +589,14 @@ def rebuild_alt_maps(guild: discord.Guild):
 # ======================= BOT =======================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.reactions = True  # Required for reaction syncing
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    load_defaults()
+    # Initialize database
+    await db.init_database()
+    
     logger.info(f"✅ Logged in as {bot.user}")
     for g in bot.guilds:
         rebuild_alt_maps(g)
@@ -544,6 +620,18 @@ async def on_message(message: discord.Message):
     if not context:
         return
 
+    # Fetch expected language from database
+    context.expected_language = await get_channel_language(context.guild_id, context.base_id)
+    
+    # Re-detect with expected language if needed
+    if context.has_content and not context.is_media_only and context.expected_language:
+        context.detected_code = detect_language(message.content, expected_language=context.expected_language)
+        context.detected_language = CODE_TO_LANGUAGE.get(context.detected_code) if context.detected_code else None
+    
+    # Fetch source_main_default_language if needed
+    if context.is_alt_source and context.source_main_id is not None:
+        context.source_main_default_language = await get_channel_language(context.guild_id, context.source_main_id) or "English"
+
     plan = build_route_plan(context)
     if not plan:
         return
@@ -554,7 +642,109 @@ async def on_message(message: discord.Message):
     if not outbounds:
         return
 
-    await asyncio.gather(*(send_outbound_message(message.guild, outbound) for outbound in outbounds))
+    # Send messages and track them in database
+    sent_messages = await asyncio.gather(
+        *(send_outbound_message(message.guild, outbound) for outbound in outbounds),
+        return_exceptions=True
+    )
+    
+    # Track all sent messages in database for reply/reaction syncing
+    for outbound, result in zip(outbounds, sent_messages):
+        if isinstance(result, discord.Message):
+            try:
+                await db.track_message(
+                    source_message_id=message.id,
+                    source_channel_id=context.base_id,
+                    dest_channel_id=outbound.destination_channel_id,
+                    dest_message_id=result.id,
+                    guild_id=context.guild_id,
+                    author_id=message.author.id,
+                    source_language=context.detected_language,
+                    dest_language=outbound.target_language,
+                    reply_to_message_id=message.reference.message_id if message.reference else None
+                )
+            except Exception as e:
+                logger.error(f"Failed to track message in database: {e}")
+
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    """
+    Sync reactions across bridged/translated messages.
+    When a user adds a reaction to a message, add the same reaction to all linked messages.
+    """
+    # Ignore bot's own reactions
+    if user.bot:
+        return
+    
+    message = reaction.message
+    
+    # Only process messages in guilds
+    if not message.guild:
+        return
+    
+    try:
+        # Get all messages linked to this one
+        linked_messages = await db.get_all_linked_messages(message.id, message.channel.id)
+        
+        if not linked_messages:
+            # This message is not tracked/bridged
+            return
+        
+        logger.info(f"Syncing reaction {reaction.emoji} from message {message.id} to {len(linked_messages)} linked messages")
+        
+        # Convert emoji to string for storage
+        emoji_str = str(reaction.emoji)
+        
+        # Add reaction to all linked messages asynchronously
+        async def add_reaction_to_message(linked_msg: dict):
+            try:
+                channel = bot.get_channel(linked_msg['channel_id'])
+                if not channel:
+                    logger.warning(f"Channel {linked_msg['channel_id']} not found for reaction sync")
+                    return False
+                
+                target_message = await channel.fetch_message(linked_msg['message_id'])
+                if not target_message:
+                    logger.warning(f"Message {linked_msg['message_id']} not found in channel {linked_msg['channel_id']}")
+                    return False
+                
+                # Add the reaction
+                await target_message.add_reaction(reaction.emoji)
+                
+                # Track this sync in database
+                await db.track_reaction_sync(
+                    source_message_id=message.id,
+                    source_channel_id=message.channel.id,
+                    emoji=emoji_str,
+                    user_id=user.id,
+                    synced_to_message_id=linked_msg['message_id'],
+                    synced_to_channel_id=linked_msg['channel_id'],
+                    guild_id=linked_msg['guild_id']
+                )
+                
+                return True
+            except discord.Forbidden:
+                logger.warning(f"Missing permissions to add reaction in channel {linked_msg['channel_id']}")
+                return False
+            except discord.NotFound:
+                logger.warning(f"Message or channel not found for reaction sync")
+                return False
+            except Exception as e:
+                logger.error(f"Failed to sync reaction: {e}")
+                return False
+        
+        # Sync reactions to all linked messages in parallel
+        results = await asyncio.gather(
+            *(add_reaction_to_message(linked_msg) for linked_msg in linked_messages),
+            return_exceptions=True
+        )
+        
+        success_count = sum(1 for r in results if r is True)
+        logger.info(f"Successfully synced reaction to {success_count}/{len(linked_messages)} messages")
+        
+    except Exception as e:
+        logger.error(f"Error in reaction sync handler: {e}")
 
 # ======================= COMMANDS =======================
 @bot.tree.command(name="channeldefaultlanguage", description="Set default language (channel + threads)")
@@ -564,14 +754,13 @@ async def cmd_default(interaction: discord.Interaction, language: str):
         return await interaction.response.send_message("Server only", ephemeral=True)
     
     base_id = interaction.channel.parent_id if isinstance(interaction.channel, discord.Thread) else interaction.channel.id
-    guild_str = str(interaction.guild.id)
     
-    if guild_str not in default_languages:
-        default_languages[guild_str] = {}
-    default_languages[guild_str][str(base_id)] = language.title()
-    save_defaults()
-    
-    await interaction.response.send_message(f"✅ Default language **{language.title()}** set for this channel + threads.")
+    try:
+        await db.set_channel_default(interaction.guild.id, base_id, language.title())
+        await interaction.response.send_message(f"✅ Default language **{language.title()}** set for this channel + threads.")
+    except Exception as e:
+        logger.error(f"Failed to set channel default: {e}")
+        await interaction.response.send_message(f"❌ Failed to set default language: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="removedefaultlanguage", description="Stop monitoring this channel")
 async def cmd_remove(interaction: discord.Interaction):
@@ -579,14 +768,16 @@ async def cmd_remove(interaction: discord.Interaction):
         return await interaction.response.send_message("Server only", ephemeral=True)
     
     base_id = interaction.channel.parent_id if isinstance(interaction.channel, discord.Thread) else interaction.channel.id
-    guild_str = str(interaction.guild.id)
     
-    if guild_str in default_languages and str(base_id) in default_languages[guild_str]:
-        del default_languages[guild_str][str(base_id)]
-        save_defaults()
-        await interaction.response.send_message("✅ Monitoring removed.")
-    else:
-        await interaction.response.send_message("No default set here.")
+    try:
+        removed = await db.remove_channel_default(interaction.guild.id, base_id)
+        if removed:
+            await interaction.response.send_message("✅ Monitoring removed.")
+        else:
+            await interaction.response.send_message("No default set here.")
+    except Exception as e:
+        logger.error(f"Failed to remove channel default: {e}")
+        await interaction.response.send_message(f"❌ Failed to remove default: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="createalternatelanguagechannel", description="Create 'Name but in X' channel")
 @app_commands.describe(language="e.g. Arabic")
@@ -595,7 +786,7 @@ async def cmd_create(interaction: discord.Interaction, language: str):
         return await interaction.response.send_message("Server only", ephemeral=True)
     
     main_ch = interaction.channel.parent if isinstance(interaction.channel, discord.Thread) else interaction.channel
-    new_name = f"{main_ch.name} but in {language.title()}"
+    new_name = f"{main_ch.name}-but-in-{language.title()}"
     
     try:
         new_ch = await interaction.guild.create_text_channel(
@@ -604,15 +795,100 @@ async def cmd_create(interaction: discord.Interaction, language: str):
             topic=f"Alternate {language.title()} translations"
         )
         # Set default language for the new alternate channel
-        guild_str = str(interaction.guild.id)
-        if guild_str not in default_languages:
-            default_languages[guild_str] = {}
-        default_languages[guild_str][str(new_ch.id)] = language.title()
-        save_defaults()
+        await db.set_channel_default(interaction.guild.id, new_ch.id, language.title())
         
         rebuild_alt_maps(interaction.guild)  # immediate update
         await interaction.response.send_message(f"✅ Created **{new_name}** and enabled bridging.")
     except discord.Forbidden:
         await interaction.response.send_message("❌ Missing Manage Channels permission.", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Failed to create alternate channel: {e}")
+        await interaction.response.send_message(f"❌ Failed to create channel: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="stats", description="Show bot statistics")
+async def cmd_stats(interaction: discord.Interaction):
+    """Display bot usage statistics from the database"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        stats = await db.get_statistics()
+        
+        # Get current month token usage
+        guild_id = interaction.guild.id if interaction.guild else None
+        token_stats = await db.get_current_month_token_usage(guild_id=guild_id)
+        
+        # Build formatted stats message
+        embed = discord.Embed(
+            title="📊 Translation Bot Statistics",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Messages
+        embed.add_field(
+            name="💬 Messages",
+            value=(
+                f"**Unique messages:** {stats['unique_messages']:,}\n"
+                f"**Total tracked:** {stats['total_messages_tracked']:,}\n"
+                f"**Translated:** {stats['translated_messages']:,}\n"
+                f"**With replies:** {stats['reply_messages']:,}"
+            ),
+            inline=False
+        )
+        
+        # Token Usage (Current Billing Period)
+        if token_stats['total_tokens'] > 0:
+            embed.add_field(
+                name="🤖 AI Token Usage (Current Month)",
+                value=(
+                    f"**Total tokens:** {token_stats['total_tokens']:,}\n"
+                    f"**Prompt tokens:** {token_stats['total_prompt_tokens']:,}\n"
+                    f"**Completion tokens:** {token_stats['total_completion_tokens']:,}\n"
+                    f"**Translations:** {token_stats['translation_count']:,}"
+                ),
+                inline=False
+            )
+        
+        # Reactions
+        if stats.get('total_reactions_synced', 0) > 0:
+            embed.add_field(
+                name="😀 Reactions",
+                value=(
+                    f"**Total synced:** {stats['total_reactions_synced']:,}\n"
+                    f"**Unique emojis:** {stats['unique_emojis_synced']:,}\n"
+                    f"**Users:** {stats['users_with_synced_reactions']:,}"
+                ),
+                inline=False
+            )
+        
+        # Configuration
+        embed.add_field(
+            name="⚙️ Configuration",
+            value=(
+                f"**Guilds configured:** {stats['guilds_configured']}\n"
+                f"**Channels monitored:** {stats['channels_configured']}"
+            ),
+            inline=False
+        )
+        
+        # Top languages
+        if stats['top_languages']:
+            lang_list = "\n".join([f"**{lang}:** {count}" for lang, count in stats['top_languages']])
+            embed.add_field(
+                name="🌐 Top Languages",
+                value=lang_list,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Requested by {interaction.user.name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Failed to get statistics: {e}")
+        await interaction.followup.send(
+            f"❌ Failed to retrieve statistics: {str(e)}",
+            ephemeral=True
+        )
 
 bot.run(TOKEN)
