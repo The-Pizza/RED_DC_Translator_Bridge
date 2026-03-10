@@ -274,6 +274,20 @@ def build_route_plan(context: MessageContext) -> List[RouteAction]:
                 if alt["id"] != context.base_id:
                     plan.append(RouteAction(destination_channel_id=alt["id"], action_type="copy"))
         else:
+            # If message language does not match the alt channel's default language,
+            # translate it in-place for that same alt channel too.
+            if context.expected_language:
+                expected_code = LANGUAGE_CODES.get(context.expected_language.lower())
+                if expected_code and context.detected_code and context.detected_code != expected_code:
+                    plan.append(
+                        RouteAction(
+                            destination_channel_id=context.base_id,
+                            action_type="translate",
+                            target_language=context.expected_language,
+                            include_mismatch_guard=True,
+                        )
+                    )
+
             plan.append(
                 RouteAction(
                     destination_channel_id=context.source_main_id,
@@ -757,7 +771,7 @@ async def cmd_default(interaction: discord.Interaction, language: str):
     
     try:
         await db.set_channel_default(interaction.guild.id, base_id, language.title())
-        await interaction.response.send_message(f"✅ Default language **{language.title()}** set for this channel + threads.")
+        await interaction.response.send_message(f"✅ Default language **{language.title()}** set for this channel + threads.", ephemeral=True)
     except Exception as e:
         logger.error(f"Failed to set channel default: {e}")
         await interaction.response.send_message(f"❌ Failed to set default language: {str(e)}", ephemeral=True)
@@ -772,9 +786,9 @@ async def cmd_remove(interaction: discord.Interaction):
     try:
         removed = await db.remove_channel_default(interaction.guild.id, base_id)
         if removed:
-            await interaction.response.send_message("✅ Monitoring removed.")
+            await interaction.response.send_message("✅ Monitoring removed.", ephemeral=True)
         else:
-            await interaction.response.send_message("No default set here.")
+            await interaction.response.send_message("No default set here.", ephemeral=True)
     except Exception as e:
         logger.error(f"Failed to remove channel default: {e}")
         await interaction.response.send_message(f"❌ Failed to remove default: {str(e)}", ephemeral=True)
@@ -798,7 +812,7 @@ async def cmd_create(interaction: discord.Interaction, language: str):
         await db.set_channel_default(interaction.guild.id, new_ch.id, language.title())
         
         rebuild_alt_maps(interaction.guild)  # immediate update
-        await interaction.response.send_message(f"✅ Created **{new_name}** and enabled bridging.")
+        await interaction.response.send_message(f"✅ Created **{new_name}** and enabled bridging.", ephemeral=True)
     except discord.Forbidden:
         await interaction.response.send_message("❌ Missing Manage Channels permission.", ephemeral=True)
     except Exception as e:
