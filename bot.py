@@ -3,6 +3,8 @@ import json
 import logging
 import asyncio
 import io
+from dataclasses import dataclass
+from typing import List, Optional
 import requests
 import discord
 from discord import app_commands
@@ -66,36 +68,93 @@ default_languages = {}      # guild_id_str -> {channel_id_str: lang_name}
 main_to_alts = {}           # guild_id -> {main_id: [{{"id": alt_id, "lang": lang_name}}, ...]}
 alt_to_main = {}            # alt_id -> {{"main_id": , "lang": }}
 
+
+@dataclass
+class MessageContext:
+    message: discord.Message
+    guild_id: int
+    base_id: int
+    expected_language: Optional[str]
+    has_content: bool
+    has_attachments: bool
+    has_embeds: bool
+    is_media_only: bool
+    should_forward_original_embeds: bool
+    detected_code: Optional[str]
+    detected_language: Optional[str]
+    is_alt_source: bool
+    source_main_id: Optional[int]
+    source_main_default_language: Optional[str]
+    source_alts: List[dict]
+
+
+@dataclass
+class RouteAction:
+    destination_channel_id: int
+    action_type: str  # "copy" or "translate"
+    target_language: Optional[str] = None
+    include_mismatch_guard: bool = False
+
+
+@dataclass
+class OutboundMessage:
+    destination_channel_id: int
+    header_text: str
+    body_text: str
+    translated_text: Optional[str]
+    attachments_data: List[tuple]
+    embeds: List[discord.Embed]
+    detected_language: Optional[str]
+    target_language: Optional[str]
+    reply_to_message_id: Optional[int] = None  # Reserved for future DB-backed reply routing.
+
 def detect_language(text: str, expected_language: str = None) -> str:
     """
     Detect language using fastText. Returns ISO 639-1 code (e.g., 'en', 'es')
-    
-    If expected_language is provided (e.g., "English", "Arabic"), checks if text
-    matches that language with sufficient confidence before falling back to detection.
-    This avoids false positives on ambiguous words like "Pizza" and reduces unnecessary translations.
+
+    If expected_language is provided (e.g., "English", "Arabic"), and that language
+    appears in the top predictions with probability reasonably close to the top result,
+    prefer the expected language. This reduces false positives on short/ambiguous text
+    (for example: "Pizza", or typo-heavy messages).
     """
     if not model:
         return None
     
     try:
+        # fastText expects one line at a time - replace newlines with spaces
+        text_single_line = text.replace('\n', ' ').replace('\r', ' ').strip()
+        
         # Get predictions (top 5 for better accuracy)
-        predictions = model.predict(text, k=5)
+        predictions = model.predict(text_single_line, k=5)
         labels = predictions[0]  # list of '__label__xx'
         probs = predictions[1]   # corresponding probabilities
         
         # Strip '__label__' prefix
         codes = [label.replace('__label__', '') for label in labels]
         
-        # If expected language provided, check confidence first
+        # Prefer expected language when it is reasonably close to the top prediction.
+        # This handles ambiguous text where channel context is a stronger signal.
         if expected_language:
             expected_code = LANGUAGE_CODES.get(expected_language.lower())
             if expected_code:
-                # Check if expected code is in top predictions with >50% confidence
+                top_code = codes[0] if len(codes) > 0 else None
+                top_prob = float(probs[0]) if len(probs) > 0 else 0.0
+
+                if top_code == expected_code:
+                    logger.debug(f"Language match: expected {expected_language} is already top prediction")
+                    return expected_code
+
                 for code, prob in zip(codes, probs):
-                    if code == expected_code and prob > 0.5:
-                        logger.debug(f"Language confident match: expected {expected_language} ({prob:.1%})")
+                    prob = float(prob)
+                    # Use expected language if it is within a reasonable margin of the top probability.
+                    # Ratio threshold keeps behavior stable across both high-confidence and low-confidence inputs.
+                    if code == expected_code and top_prob > 0 and (prob / top_prob) >= 0.60:
+                        logger.debug(
+                            f"Language override by channel context: expected {expected_language} "
+                            f"({prob:.1%}) vs top {top_code} ({top_prob:.1%})"
+                        )
                         return expected_code
-                # If not confident, fall through to standard detection
+                # If not within margin, fall through to standard detection.
         
         # Standard detection: take the top prediction
         detected_code = codes[0]
@@ -127,19 +186,6 @@ def save_defaults():
     except Exception as e:
         logger.error(f"Failed to save defaults: {e}")
 
-def message_to_dict(msg: discord.Message) -> dict:
-    return {
-        "id": str(msg.id),
-        "content": msg.content,
-        "author": {"id": str(msg.author.id), "name": msg.author.name, "bot": msg.author.bot},
-        "channel_id": str(msg.channel.id),
-        "guild_id": str(msg.guild.id) if msg.guild else None,
-        "created_at": msg.created_at.isoformat(),
-        "attachments": [a.url for a in msg.attachments],
-        "embeds": [e.to_dict() for e in msg.embeds],
-        "is_thread": isinstance(msg.channel, discord.Thread)
-    }
-
 def should_forward_embeds(message: discord.Message) -> bool:
     """
     Forward original embeds only when there is no URL in content.
@@ -149,6 +195,255 @@ def should_forward_embeds(message: discord.Message) -> bool:
     content = (message.content or "").lower()
     has_url = "http://" in content or "https://" in content
     return bool(message.embeds) and not has_url
+
+
+def is_media_only_message(message: discord.Message, has_content: bool, has_attachments: bool, has_embeds: bool) -> bool:
+    """Classify whether a message should skip translation and be forwarded as media-only."""
+    content_lower = message.content.strip().lower() if has_content else ""
+    is_media_only = False
+
+    if content_lower.startswith(("http://", "https://")):
+        if any(content_lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".webm")):
+            is_media_only = True
+        elif any(domain in content_lower for domain in ("tenor.com/", "giphy.com/", "imgur.com/", "gfycat.com/", "i.redd.it/")):
+            is_media_only = True
+
+    if not has_content and (has_attachments or has_embeds):
+        is_media_only = True
+
+    return is_media_only
+
+
+def analyze_message(message: discord.Message) -> Optional[MessageContext]:
+    """Analyze inbound message once and normalize all routing/language state."""
+    if message.author.bot:
+        return None
+
+    has_content = bool(message.content.strip())
+    has_attachments = bool(message.attachments)
+    has_embeds = bool(message.embeds)
+
+    if not has_content and not has_attachments and not has_embeds:
+        return None
+
+    is_media_only = is_media_only_message(message, has_content, has_attachments, has_embeds)
+    base_id = message.channel.parent_id if isinstance(message.channel, discord.Thread) else message.channel.id
+    guild_id = message.guild.id
+    expected_language = default_languages.get(str(guild_id), {}).get(str(base_id))
+
+    detected_code = None if is_media_only else detect_language(message.content, expected_language=expected_language)
+    detected_language = CODE_TO_LANGUAGE.get(detected_code) if detected_code else None
+
+    is_alt_source = base_id in alt_to_main
+    source_main_id = alt_to_main[base_id]["main_id"] if is_alt_source else None
+    source_main_default_language = None
+    source_alts = []
+
+    if is_alt_source and source_main_id is not None:
+        source_main_default_language = default_languages.get(str(guild_id), {}).get(str(source_main_id), "English")
+        source_alts = main_to_alts.get(guild_id, {}).get(source_main_id, [])
+    elif not is_alt_source:
+        source_alts = main_to_alts.get(guild_id, {}).get(base_id, [])
+
+    logger.debug(
+        f"Message analyzed in {message.channel.id}: "
+        f"text={has_content}, attachments={len(message.attachments)}, embeds={len(message.embeds)}, "
+        f"media_only={is_media_only}, detected={detected_language or 'Unknown'}"
+    )
+
+    return MessageContext(
+        message=message,
+        guild_id=guild_id,
+        base_id=base_id,
+        expected_language=expected_language,
+        has_content=has_content,
+        has_attachments=has_attachments,
+        has_embeds=has_embeds,
+        is_media_only=is_media_only,
+        should_forward_original_embeds=should_forward_embeds(message),
+        detected_code=detected_code,
+        detected_language=detected_language,
+        is_alt_source=is_alt_source,
+        source_main_id=source_main_id,
+        source_main_default_language=source_main_default_language,
+        source_alts=source_alts,
+    )
+
+
+def build_route_plan(context: MessageContext) -> List[RouteAction]:
+    """Build delivery plan without performing network/translation work."""
+    plan: List[RouteAction] = []
+
+    if context.is_alt_source and context.source_main_id is not None:
+        if context.is_media_only:
+            plan.append(RouteAction(destination_channel_id=context.source_main_id, action_type="copy"))
+            for alt in context.source_alts:
+                if alt["id"] != context.base_id:
+                    plan.append(RouteAction(destination_channel_id=alt["id"], action_type="copy"))
+        else:
+            plan.append(
+                RouteAction(
+                    destination_channel_id=context.source_main_id,
+                    action_type="translate",
+                    target_language=context.source_main_default_language,
+                )
+            )
+            for alt in context.source_alts:
+                if alt["id"] != context.base_id:
+                    plan.append(
+                        RouteAction(
+                            destination_channel_id=alt["id"],
+                            action_type="translate",
+                            target_language=alt["lang"],
+                        )
+                    )
+        return plan
+
+    if not context.is_media_only and context.expected_language:
+        expected_code = LANGUAGE_CODES.get(context.expected_language.lower())
+        if expected_code and context.detected_code and context.detected_code != expected_code:
+            plan.append(
+                RouteAction(
+                    destination_channel_id=context.base_id,
+                    action_type="translate",
+                    target_language=context.expected_language,
+                    include_mismatch_guard=True,
+                )
+            )
+
+    if context.source_alts:
+        if context.is_media_only:
+            for alt in context.source_alts:
+                plan.append(RouteAction(destination_channel_id=alt["id"], action_type="copy"))
+        else:
+            for alt in context.source_alts:
+                plan.append(
+                    RouteAction(
+                        destination_channel_id=alt["id"],
+                        action_type="translate",
+                        target_language=alt["lang"],
+                    )
+                )
+
+    return plan
+
+
+async def fetch_attachment_payloads(attachments: List[discord.Attachment]) -> List[tuple]:
+    """Download attachments once and keep raw bytes for per-destination file creation."""
+    payloads: List[tuple] = []
+    if not attachments:
+        return payloads
+
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        for attachment in attachments:
+            try:
+                async with session.get(attachment.url) as resp:
+                    if resp.status == 200:
+                        payloads.append((attachment.filename, await resp.read()))
+                    else:
+                        logger.warning(f"Failed to download attachment {attachment.filename}: status {resp.status}")
+            except Exception as e:
+                logger.warning(f"Failed to download attachment {attachment.filename}: {e}")
+    return payloads
+
+
+async def compose_outbound_messages(context: MessageContext, plan: List[RouteAction]) -> List[OutboundMessage]:
+    """Compose outbound payloads (copy/translate) that can be sent via one sender function."""
+    outbounds: List[OutboundMessage] = []
+
+    attachments_data: List[tuple] = []
+    if context.has_attachments:
+        attachments_data = await fetch_attachment_payloads(context.message.attachments)
+
+    embeds = list(context.message.embeds) if context.should_forward_original_embeds else []
+    body_text = context.message.content or ""
+
+    async def compose_translate(action: RouteAction) -> Optional[OutboundMessage]:
+        if not action.target_language:
+            return None
+
+        translated = await translate_text(body_text, action.target_language)
+        if not translated:
+            return None
+
+        if action.include_mismatch_guard and translated == body_text:
+            return None
+
+        header = f"<@{context.message.author.id}> -- {(context.detected_language or 'Unknown')} → {action.target_language}"
+        return OutboundMessage(
+            destination_channel_id=action.destination_channel_id,
+            header_text=header,
+            body_text=body_text,
+            translated_text=translated,
+            attachments_data=attachments_data,
+            embeds=embeds,
+            detected_language=context.detected_language,
+            target_language=action.target_language,
+        )
+
+    translate_actions: List[RouteAction] = []
+    for action in plan:
+        if action.action_type == "copy":
+            outbounds.append(
+                OutboundMessage(
+                    destination_channel_id=action.destination_channel_id,
+                    header_text=f"<@{context.message.author.id}>",
+                    body_text=body_text,
+                    translated_text=None,
+                    attachments_data=attachments_data,
+                    embeds=embeds,
+                    detected_language=context.detected_language,
+                    target_language=None,
+                )
+            )
+        elif action.action_type == "translate":
+            translate_actions.append(action)
+
+    if translate_actions:
+        translated_outbounds = await asyncio.gather(*(compose_translate(action) for action in translate_actions))
+        outbounds.extend([outbound for outbound in translated_outbounds if outbound is not None])
+
+    return outbounds
+
+
+async def send_outbound_message(guild: discord.Guild, outbound: OutboundMessage):
+    """Single sender entrypoint for all outbound message variants."""
+    try:
+        channel = guild.get_channel(int(outbound.destination_channel_id))
+        if not channel:
+            logger.error(f"Channel {outbound.destination_channel_id} not found")
+            return
+
+        files = [discord.File(io.BytesIO(data), filename=filename) for filename, data in outbound.attachments_data]
+        body = outbound.translated_text if outbound.translated_text is not None else outbound.body_text
+
+        if outbound.translated_text is not None:
+            if len(body) > 2000:
+                embed = discord.Embed(description=body)
+                await channel.send(content=outbound.header_text, embed=embed, files=files)
+            else:
+                await channel.send(f"{outbound.header_text}\n{body}", files=files)
+        else:
+            if body or files:
+                if body:
+                    await channel.send(f"{outbound.header_text}\n{body}", files=files)
+                else:
+                    await channel.send(outbound.header_text, files=files)
+
+        for embed in outbound.embeds:
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                logger.warning(f"Failed to send embed: {e}")
+
+        logger.info(
+            f"Sent outbound to channel {outbound.destination_channel_id} "
+            f"(translated={outbound.translated_text is not None}, attachments={len(files)}, embeds={len(outbound.embeds)})"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send outbound message: {e}")
 
 async def translate_text(content: str, target_language: str) -> str:
     """
@@ -200,53 +495,6 @@ async def translate_text(content: str, target_language: str) -> str:
         logger.error(f"Translation failed: {e}")
         return None
 
-async def post_translation_to_discord(guild: discord.Guild, channel_id: str, author_id: str, 
-                                      detected_language: str, target_language: str, 
-                                      translated_text: str, attachments: list = None, embeds: list = None):
-    """Post translated message to a Discord channel with optional attachments and embeds"""
-    try:
-        channel = guild.get_channel(int(channel_id))
-        if not channel:
-            logger.error(f"Channel {channel_id} not found")
-            return
-        
-        # Create message header
-        header = f"<@{author_id}> -- {detected_language} → {target_language}"
-        
-        # Prepare files from attachments (download and re-upload to preserve them)
-        files = []
-        if attachments:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                for attachment in attachments:
-                    try:
-                        async with session.get(attachment.url) as resp:
-                            if resp.status == 200:
-                                data = await resp.read()
-                                files.append(discord.File(io.BytesIO(data), filename=attachment.filename))
-                    except Exception as e:
-                        logger.warning(f"Failed to download attachment {attachment.filename}: {e}")
-        
-        # Post as embed if text is long, otherwise as regular message
-        if len(translated_text) > 2000:
-            embed = discord.Embed(description=translated_text)
-            await channel.send(content=header, embed=embed, files=files)
-        else:
-            await channel.send(f"{header}\n{translated_text}", files=files)
-        
-        # Send original embeds only when URL auto-unfurl is not available.
-        if embeds:
-            for embed in embeds:
-                try:
-                    await channel.send(embed=embed)
-                except Exception as e:
-                    logger.warning(f"Failed to send embed: {e}")
-        
-        logger.info(f"Posted translation to channel {channel_id} with {len(files)} attachments and {len(embeds) if embeds else 0} embeds")
-    except Exception as e:
-        logger.error(f"Failed to post translation: {e}")
-
-
 def rebuild_alt_maps(guild: discord.Guild):
     main_to_alts[guild.id] = {}
     for ch in guild.text_channels:
@@ -292,246 +540,21 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    
-    # Allow messages with attachments/embeds even if content is empty
-    has_content = bool(message.content.strip())
-    has_attachments = bool(message.attachments)
-    has_embeds = bool(message.embeds)
-    
-    if not has_content and not has_attachments and not has_embeds:
+    context = analyze_message(message)
+    if not context:
         return
 
-    logger.debug(f"Message in {message.channel.id}: {message.content[:100] if has_content else '[no text]'}... (attachments: {len(message.attachments)}, embeds: {len(message.embeds)})")
-    
-    # Check if message is only a media URL (image, gif, video)
-    content_lower = message.content.strip().lower() if has_content else ""
-    is_media_only = False
-    
-    # Check for direct media file URLs
-    if content_lower.startswith(('http://', 'https://')):
-        # Direct file extensions
-        if any(content_lower.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.mov', '.webm')):
-            is_media_only = True
-        # Media hosting domains (tenor, giphy, imgur, etc.)
-        elif any(domain in content_lower for domain in ('tenor.com/', 'giphy.com/', 'imgur.com/', 'gfycat.com/', 'i.redd.it/')):
-            is_media_only = True
-    
-    # Also treat messages with only attachments/embeds as media-only
-    if not has_content and (has_attachments or has_embeds):
-        is_media_only = True
-
-    # Detect language once for all operations (skip detection for media-only)
-    detected_code = None if is_media_only else detect_language(message.content)
-    detected_language = CODE_TO_LANGUAGE.get(detected_code) if detected_code else None
-
-    # Base channel (handles threads)
-    base_id = message.channel.parent_id if isinstance(message.channel, discord.Thread) else message.channel.id
-    guild_id = message.guild.id
-
-    # 1. ALTERNATE CHANNEL → toMain + other alts
-    if base_id in alt_to_main:
-        main_id = alt_to_main[base_id]["main_id"]
-        main_default = default_languages.get(str(guild_id), {}).get(str(main_id), "English")
-        
-        if is_media_only:
-            logger.info(f"Media-only message from alt channel, posting without translation")
-            # Post media to main channel without translation (URL auto-embeds, attachments, embeds)
-            tasks = []
-            
-            async def post_to_main():
-                channel = message.guild.get_channel(main_id)
-                if channel:
-                    # Prepare files from attachments
-                    files = []
-                    if message.attachments:
-                        import aiohttp
-                        async with aiohttp.ClientSession() as session:
-                            for attachment in message.attachments:
-                                try:
-                                    async with session.get(attachment.url) as resp:
-                                        if resp.status == 200:
-                                            data = await resp.read()
-                                            files.append(discord.File(io.BytesIO(data), filename=attachment.filename))
-                                except Exception as e:
-                                    logger.warning(f"Failed to download attachment: {e}")
-                    
-                    # Send content with attachments
-                    if message.content or files:
-                        await channel.send(f"<@{message.author.id}>\n{message.content}" if message.content else f"<@{message.author.id}>", files=files)
-                    
-                    # Send embeds separately only when URL auto-unfurl is not available
-                    if should_forward_embeds(message):
-                        for embed in message.embeds:
-                            try:
-                                await channel.send(embed=embed)
-                            except Exception as e:
-                                logger.warning(f"Failed to send embed: {e}")
-            
-            tasks.append(post_to_main())
-            
-            # Post to other alts without translation
-            other_alts = main_to_alts.get(guild_id, {}).get(main_id, [])
-            for alt in other_alts:
-                if alt["id"] != base_id:
-                    async def post_to_alt(alt_data=alt):
-                        channel = message.guild.get_channel(alt_data["id"])
-                        if channel:
-                            # Prepare files from attachments
-                            files = []
-                            if message.attachments:
-                                import aiohttp
-                                async with aiohttp.ClientSession() as session:
-                                    for attachment in message.attachments:
-                                        try:
-                                            async with session.get(attachment.url) as resp:
-                                                if resp.status == 200:
-                                                    data = await resp.read()
-                                                    files.append(discord.File(io.BytesIO(data), filename=attachment.filename))
-                                        except Exception as e:
-                                                logger.warning(f"Failed to download attachment: {e}")
-                            
-                            # Send content with attachments
-                            if message.content or files:
-                                await channel.send(f"<@{message.author.id}>\n{message.content}" if message.content else f"<@{message.author.id}>", files=files)
-                            
-                            # Send embeds separately only when URL auto-unfurl is not available
-                            if should_forward_embeds(message):
-                                for embed in message.embeds:
-                                    try:
-                                        await channel.send(embed=embed)
-                                    except Exception as e:
-                                        logger.warning(f"Failed to send embed: {e}")
-                    
-                    tasks.append(post_to_alt())
-            
-            # Run all posts in parallel
-            if tasks:
-                await asyncio.gather(*tasks)
-        else:
-            logger.info(f"Message from alt channel: {detected_language} → {main_default}")
-            
-            # Create translation tasks to run in parallel
-            tasks = []
-            
-            # Translate to main channel
-            async def translate_to_main():
-                translated = await translate_text(message.content, main_default)
-                if translated:
-                    forward_embeds = message.embeds if should_forward_embeds(message) else None
-                    await post_translation_to_discord(message.guild, str(main_id), str(message.author.id),
-                                                    detected_language or "Unknown", main_default, translated,
-                                                    attachments=message.attachments, embeds=forward_embeds)
-            
-            tasks.append(translate_to_main())
-            
-            # Translate to all other alternate channels
-            other_alts = main_to_alts.get(guild_id, {}).get(main_id, [])
-            for alt in other_alts:
-                if alt["id"] != base_id:  # Don't send back to the source channel
-                    async def translate_to_alt(alt_data=alt):  # Capture alt in closure
-                        logger.info(f"Message to alt channel {alt_data['id']}: {detected_language} → {alt_data['lang']}")
-                        translated = await translate_text(message.content, alt_data["lang"])
-                        if translated:
-                            forward_embeds = message.embeds if should_forward_embeds(message) else None
-                            await post_translation_to_discord(message.guild, str(alt_data["id"]), str(message.author.id),
-                                                            detected_language or "Unknown", alt_data["lang"], translated,
-                                                            attachments=message.attachments, embeds=forward_embeds)
-                    
-                    tasks.append(translate_to_alt())
-            
-            # Run all translations in parallel
-            if tasks:
-                await asyncio.gather(*tasks)
-        
+    plan = build_route_plan(context)
+    if not plan:
         return
 
-    # 2. DEFAULT LANGUAGE MONITORING (mismatch only)
-    # Skip language monitoring for media-only messages
-    if not is_media_only:
-        guild_defaults = default_languages.get(str(guild_id), {})
-        default_lang = guild_defaults.get(str(base_id))
-        if default_lang:
-            try:
-                # Use context-aware detection: check if text is in the default language
-                # If confident it matches default language, don't translate (avoid false positives on ambiguous words)
-                context_detected_code = detect_language(message.content, expected_language=default_lang)
-                expected_code = LANGUAGE_CODES.get(default_lang.lower())
-                if expected_code and context_detected_code and context_detected_code != expected_code:
-                    context_detected_lang = CODE_TO_LANGUAGE.get(context_detected_code, "Unknown")
-                    logger.info(f"Language mismatch in channel: detected {context_detected_lang}, expected {default_lang}")
-                    translated = await translate_text(message.content, default_lang)
-                    # Only post if translation is different from original (avoid false positives)
-                    if translated and translated != message.content:
-                        forward_embeds = message.embeds if should_forward_embeds(message) else None
-                        await post_translation_to_discord(message.guild, str(base_id), str(message.author.id),
-                                                        context_detected_lang, default_lang, translated,
-                                                        attachments=message.attachments, embeds=forward_embeds)
-                elif expected_code and not context_detected_code:
-                    logger.debug("Language detection unavailable/unknown; skipping default-language mismatch translation")
-            except Exception as e:
-                logger.debug(f"Default language check failed: {e}")
+    logger.info(f"Built processing plan for message {message.id}: {len(plan)} actions")
 
-    # 3. MAIN CHANNEL → toChild (one call per alternate)
-    alts = main_to_alts.get(guild_id, {}).get(base_id, [])
-    if alts:
-        if is_media_only:
-            logger.info(f"Media-only message from main channel, posting to {len(alts)} alts without translation")
-            tasks = []
-            for alt in alts:
-                async def post_to_alt(alt_data=alt):
-                    channel = message.guild.get_channel(alt_data["id"])
-                    if channel:
-                        # Prepare files from attachments
-                        files = []
-                        if message.attachments:
-                            import aiohttp
-                            async with aiohttp.ClientSession() as session:
-                                for attachment in message.attachments:
-                                    try:
-                                        async with session.get(attachment.url) as resp:
-                                            if resp.status == 200:
-                                                data = await resp.read()
-                                                files.append(discord.File(io.BytesIO(data), filename=attachment.filename))
-                                    except Exception as e:
-                                        logger.warning(f"Failed to download attachment: {e}")
-                        
-                        # Send content with attachments
-                        if message.content or files:
-                            await channel.send(f"<@{message.author.id}>\n{message.content}" if message.content else f"<@{message.author.id}>", files=files)
-                        
-                        # Send embeds separately only when URL auto-unfurl is not available
-                        if should_forward_embeds(message):
-                            for embed in message.embeds:
-                                try:
-                                    await channel.send(embed=embed)
-                                except Exception as e:
-                                    logger.warning(f"Failed to send embed: {e}")
-                
-                tasks.append(post_to_alt())
-            
-            # Run all posts in parallel
-            if tasks:
-                await asyncio.gather(*tasks)
-        else:
-            # Create translation tasks to run in parallel
-            tasks = []
-            for alt in alts:
-                async def translate_to_alt(alt_data=alt):  # Capture alt in closure
-                    logger.info(f"Message from main channel: {detected_language} → {alt_data['lang']}")
-                    translated = await translate_text(message.content, alt_data["lang"])
-                    if translated:
-                        forward_embeds = message.embeds if should_forward_embeds(message) else None
-                        await post_translation_to_discord(message.guild, str(alt_data["id"]), str(message.author.id),
-                                                        detected_language or "Unknown", alt_data["lang"], translated,
-                                                        attachments=message.attachments, embeds=forward_embeds)
-                
-                tasks.append(translate_to_alt())
-            
-            # Run all translations in parallel
-            if tasks:
-                await asyncio.gather(*tasks)
+    outbounds = await compose_outbound_messages(context, plan)
+    if not outbounds:
+        return
+
+    await asyncio.gather(*(send_outbound_message(message.guild, outbound) for outbound in outbounds))
 
 # ======================= COMMANDS =======================
 @bot.tree.command(name="channeldefaultlanguage", description="Set default language (channel + threads)")
