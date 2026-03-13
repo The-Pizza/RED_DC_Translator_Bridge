@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import io
+import unicodedata
 from dataclasses import dataclass
 from typing import List, Optional
 import requests
@@ -50,6 +51,9 @@ LANGUAGE_CODES = {
 
 # Reverse map: ISO 639-1 code -> Language name (title case)
 CODE_TO_LANGUAGE = {v: k.title() for k, v in LANGUAGE_CODES.items()}
+
+# Right-to-left languages we explicitly support for directional isolation.
+RTL_LANGUAGE_CODES = {"ar", "he", "fa", "ur"}
 
 # Load fastText language identification model
 model_path = os.path.join(DATA_DIR, "lid.176.bin")
@@ -176,6 +180,65 @@ async def get_channel_language(guild_id: int, channel_id: int) -> Optional[str]:
     except Exception as e:
         logger.error(f"Failed to get channel default: {e}")
         return None
+
+def _language_to_code(language: Optional[str]) -> Optional[str]:
+    if not language:
+        return None
+
+    normalized = language.strip().lower()
+    if not normalized:
+        return None
+
+    if normalized in LANGUAGE_CODES:
+        return LANGUAGE_CODES[normalized]
+
+    # Allow callers to pass ISO 639-1 code directly.
+    if len(normalized) == 2:
+        return normalized
+
+    return None
+
+def _is_rtl_language(language: Optional[str]) -> bool:
+    code = _language_to_code(language)
+    return bool(code and code in RTL_LANGUAGE_CODES)
+
+def _first_strong_direction(text: str) -> Optional[str]:
+    """Return 'rtl' or 'ltr' using Unicode bidi classes of the first strong character."""
+    for ch in text:
+        bidi = unicodedata.bidirectional(ch)
+        if bidi in {"R", "AL"}:
+            return "rtl"
+        if bidi == "L":
+            return "ltr"
+    return None
+
+def apply_directional_isolation(
+    text: str,
+    target_language: Optional[str] = None,
+    detected_language: Optional[str] = None,
+) -> str:
+    """
+    Wrap text in Unicode RTL isolate markers when needed.
+
+    Discord can visually reorder mixed Arabic + Latin/emoji text when no explicit
+    directional context is provided. RLI/PDI keeps ordering stable.
+    """
+    if not text:
+        return text
+
+    # Avoid double-wrapping already isolated content.
+    if text.startswith("\u2067") and text.endswith("\u2069"):
+        return text
+
+    prefer_rtl = _is_rtl_language(target_language) or (
+        not target_language and _is_rtl_language(detected_language)
+    )
+
+    # Fallback: if metadata is missing, infer from first strong directional char.
+    if not prefer_rtl and _first_strong_direction(text) == "rtl":
+        prefer_rtl = True
+
+    return f"\u2067{text}\u2069" if prefer_rtl else text
 
 def should_forward_embeds(message: discord.Message) -> bool:
     """
@@ -402,6 +465,12 @@ async def compose_outbound_messages(context: MessageContext, plan: List[RouteAct
 
         if action.include_mismatch_guard and translated == body_text:
             return None
+
+        translated = apply_directional_isolation(
+            translated,
+            target_language=action.target_language,
+            detected_language=context.detected_language,
+        )
 
         header = f"<@{context.message.author.id}> -- {(context.detected_language or 'Unknown')} → {action.target_language}"
         return OutboundMessage(
