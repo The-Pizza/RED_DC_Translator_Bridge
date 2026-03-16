@@ -41,7 +41,7 @@ docker run -d \
   ghcr.io/the-pizza/red-dc-translator-bridge:latest
 ```
 
-**Important**: The container automatically downloads the 131MB fastText language model (`lid.176.bin`) on first startup. This is stored in the `/data` volume for persistence.
+**Important**: The fastText language model file (`lid.176.bin`) should be stored outside the `/data` volume (default: `/app/models/lid.176.bin`). This keeps model files separate from persistent database storage.
 
 ### Environment Variables
 
@@ -54,7 +54,8 @@ docker run -d \
 | `LLM_SYSTEM_PROMPT` | No | Custom system prompt for the translator (default: professional translator prompt) |
 | `GUILD_ID` | No | Specific server ID for faster slash command sync (global sync if omitted) |
 | `LOG_LEVEL` | No | Logging level (default: `INFO`) - options: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `DATA_DIR` | No | Directory for storing data (default: `/data`) |
+| `DATA_DIR` | No | Directory for runtime data and SQLite DB directory (default: `/data`) |
+| `FASTTEXT_MODEL_PATH` | No | Absolute path to `lid.176.bin` (default in Docker image: `/app/models/lid.176.bin`) |
 | `DATABASE_URL` | No | Database connection string (default: `sqlite+aiosqlite:///data/bot.db` for SQLite) |
 
 ### LLM Provider Configuration
@@ -109,8 +110,8 @@ sudo apt-get update && sudo apt-get install -y build-essential g++
 pip install -r requirements.txt
 
 # Download fastText language model (131MB)
-mkdir -p data
-wget -O data/lid.176.bin https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
+mkdir -p models
+wget -O models/lid.176.bin https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
 
 # Set environment variables
 export DISCORD_TOKEN=your_discord_token
@@ -118,6 +119,7 @@ export LLM_API_KEY=your_api_key
 export LLM_API_URL=https://api.x.ai/v1/chat/completions
 export LLM_MODEL=grok-4-1-fast-non-reasoning
 export LOG_LEVEL=INFO
+export FASTTEXT_MODEL_PATH=$PWD/models/lid.176.bin
 
 # Run bot
 python bot.py
@@ -228,6 +230,7 @@ The bot uses **SQLAlchemy** with database persistence for storing:
 - Zero configuration required
 - Perfect for single-instance deployments
 - Database file persists in the `/data` volume
+- fastText model path is independent (default: `/app/models/lid.176.bin` in Docker)
 
 **PostgreSQL (Optional)**:
 - For larger deployments or multi-shard setups
